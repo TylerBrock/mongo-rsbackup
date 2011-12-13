@@ -1,0 +1,10 @@
+http://www.mongodb.org/display/DOCS/Why+Replica+Sets
+
+Read Scaling
+Most drivers provide a slaveOkay method for identifying that a specific operation can be run on a secondary node. When using slaveOkay, a system can share the read load amongst several nodes.
+(Several secondary nodes only)
+
+http://www.mongodb.org/display/DOCS/Replica+Sets+-+Basics
+
+Any operations that change data will now be replicated from sf1 to sf2. (what about existing data?)
+If sf1 is shut down, you will see sf2 take over as primary (why not s3?)
