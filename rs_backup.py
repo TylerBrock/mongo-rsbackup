@@ -6,10 +6,11 @@ Backup a member of a replica set
 
 import argparse
 import os
+import sys
 import subprocess
-import paramiko
 import logging
 import tarfile
+import copy
 
 import pymongo
 
@@ -23,6 +24,10 @@ source_dir = os.path.join('data','db')
 # Global defaults
 compression_level = 1
 
+class ReplSet:
+    def __init__(self):
+        
+
 class Host:
     def __init__(self, hostname='localhost', port=27017, user=None, 
         password=None, sshuser=None, sshpass=None, sshport=22):
@@ -30,10 +35,57 @@ class Host:
         self.port = port
         self.user = user
         self.password = password
-        self.sshuser = sshuser
         self.sshpass = sshpass
         self.sshport = sshport
+
+        # must connect as root user for file permissions
+        self.sshuser = 'root'
+
+    def __str__(self):
+        return self.hostname + ":" + str(self.port)
+
+    def connect(self):
+        self.connection = pymongo.Connection(self.mongo_uri())
+        self.primary = self.getPrimary()
+        self.pri_con = pymongo.Connection(self.primary)
     
+    def adminCommand(self, command, value=1, primary=False):
+        if primary:
+            return self.pri_con.admin.command(command, value)
+        else:
+            return self.connection.admin.command(command, value)
+
+    def replStatus(self):
+        return self.adminCommand("replSetGetStatus")
+
+    def replConfig(self):
+        return self.connection.local.system.replset.find_one()
+
+    def isSecondary(self):
+        return self.adminCommand('isMaster')['secondary']
+
+    def getPrimary(self):
+        return self.adminCommand('isMaster')['primary']
+
+    def getMe(self):
+        return self.adminCommand('isMaster')['me']
+
+    def replRemove(self):
+        logging.debug('Removing {host} from replica set'.format(host=self))
+        self.old_config = self.replConfig()
+        old_members = self.old_config['members']
+        me = self.getMe()
+        new_members = [member for member in old_members if member['host'] != me]
+        new_config = copy.copy(self.old_config)
+        new_config['members'] = new_members
+        new_config['version'] += 1
+        self.adminCommand('replSetReconfig', new_config, primary=True)
+
+    def replRestore(self):
+        logging.debug('Adding {host} back to replica set'.format(host=self))
+        self.old_config['version'] += 2
+        self.adminCommand('replSetReconfig', self.old_config, primary=True)
+
     def mongo_uri(self):
         #mongodb://[username:password@]host1[:port1][/[database]
         if self.user:
@@ -48,33 +100,39 @@ class Host:
                 host=self.hostname,
                 port=self.port
             )
-    
-    def __str__(self):
-        return self.hostname
         
 class Backup:
-    def __init__(self, host, kind='mongodump', lock=False):
-        logging.debug('Initializing %s backup object with lock: %s',
-            kind, lock
-        )
+    def __init__(self, host, kind='mongodump', offline=False):
+        logging.debug('Initializing {kind} backup object, offline: {offline}'.format(
+            kind=kind,
+            offline=offline
+        ))
         self.host = host
         self.kind = kind
-        self.lock = lock
+        self.offline = offline
         
-        if self.lock:
-            self.connection = pymongo.Connection(self.host.hostname, self.host.port)
-            if self.host.user and self.host.password:
-                self.connection.admin.authenticate(self.host.user, self.host.password)
+        if self.offline:
+            pass
+            #self.connection = pymongo.Connection(self.host.hostname, self.host.port)
+            #if self.host.user and self.host.password:
+            #    self.connection.admin.authenticate(self.host.user, self.host.password)
         if self.kind == 'raw':
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
     def prepare(self):
-        logging.info('Preparing to backup %s', self.host)
-        if self.lock: self.connection.admin.command("fsync", lock=True)
+        logging.info('Preparing to backup {host}'.format( host=self.host ))
+        # Shutdown the database
+        self.host.connect()
+        if self.offline:
+            if self.host.isSecondary():
+                self.host.replRemove()
+            else:
+                logging.error("Host is not secondary")
+                sys.exit()
         
     def backup(self):
-        logging.info('Backing up %s', self.host)
+        logging.info('Backing up {host}'.format( host=self.host ))
         if self.kind == 'mongodump':
             logging.info('Performing mongodump...')
             cmd = ["mongodump",
@@ -87,7 +145,7 @@ class Backup:
                 stdin=subprocess.PIPE,
                 stderr=subprocess.STDOUT
             )
-        elif self.kind == 'raw' and self.connection.is_locked:
+        elif self.kind == 'raw': # and check for offline status
             logging.info('Performing raw backup...')
             self.ssh_connect()
             # ssh -n remotehost "tar jcvf - SOURCEDIR" > DESTFILE.tar.gz
@@ -118,8 +176,8 @@ class Backup:
         )
     
     def restore(self):
-        logging.info('Restoring %s', self.host)
-        if self.lock: self.connection.unlock()
+        logging.info('Restoring {host}'.format(host=self.host))
+        self.host.replRestore()
         
     def run(self):
         self.prepare()
@@ -128,7 +186,7 @@ class Backup:
         self.restore()
     
 def setup_logging(level=logging.DEBUG):
-    logger = logging.basicConfig(
+    logging.basicConfig(
         format='%(asctime)s %(levelname)-8s %(message)s',
         datefmt='%m/%d/%Y %I:%M:%S %p',
         level=level
@@ -141,7 +199,6 @@ def parse_args():
     parser.add_argument('--user', help='MongoDB username (mongodump backup)')
     parser.add_argument('--password', help='MongoDB password (mongodump backup)')
     parser.add_argument('--port', help='port of mongod to backup', type=int)
-    parser.add_argument('--sshuser', help='ssh username (raw backup)')
     parser.add_argument('--sshpass', help='ssh password (raw backup)')
     parser.add_argument('--sshport', help='port of ssh host to backup', type=int)
     parser.add_argument('--srcdir', help='remote database data directory')
@@ -150,8 +207,8 @@ def parse_args():
         default='mongodump',
         help='mongodump (default) or raw (copy dbfiles) requires lock to avoid corruption'
     )
-    parser.add_argument('--lock', action='store_true', default=False,
-        help='fsync and lock database during backup',
+    parser.add_argument('--offline', action='store_true', default=False,
+        help='take database offline during backup',
     )
     parser.add_argument('--verbose', action='store_true', default=False,
         help='show debuging information'
@@ -165,12 +222,11 @@ def main(args):
     if args.port: host.port = args.port
     if args.user: host.user = args.user
     if args.password: host.password = args.password
-    if args.sshuser: host.sshuser = args.sshuser
     if args.sshpass: host.sshpassword = args.sshpass
     if args.sshport: host.sshport = args.sshport
     backup_args = {}
     if args.kind == 'raw': backup_args['kind'] = 'raw' 
-    if args.lock: backup_args['lock'] = True
+    if args.offline: backup_args['offline'] = True
     backup = Backup(host, **backup_args)
     if args.dir: backup_dir = args.dir
     if args.srcdir: source_dir = args.srcdir
